@@ -10,33 +10,69 @@ const SCOPES = [
   "https://www.googleapis.com/auth/forms.body",
   "https://www.googleapis.com/auth/drive"
 ];
-const TOKEN_PATH        = path.join(__dirname, "token.json");
-const CREDENTIALS_PATH  = path.join(__dirname, "oauth_credentials.json");
-const REDIRECT_URI      = "http://localhost:8080/oauth2callback";
-const CENTRAL_SHEET_ID  = "1Wj0LzFPa5esKLCjGW_UfsdYUAtOIJ-YnhKiCA8X9o44";
-const APPS_SCRIPT_URL   = "https://script.google.com/macros/s/AKfycbwxFrbzD1aTkAbUaydrZ_05U9RR4qH5xUcjTRFaPAE981ToOJ1r95TWYxfW4IIX_Kfo/exec";
+const CENTRAL_SHEET_ID = "1Wj0LzFPa5esKLCjGW_UfsdYUAtOIJ-YnhKiCA8X9o44";
+const APPS_SCRIPT_URL  = "https://script.google.com/macros/s/AKfycbwxFrbzD1aTkAbUaydrZ_05U9RR4qH5xUcjTRFaPAE981ToOJ1r95TWYxfW4IIX_Kfo/exec";
+const REDIRECT_URI     = process.env.REDIRECT_URI || "http://localhost:8080/oauth2callback";
 
-if (!fs.existsSync(CREDENTIALS_PATH)) {
-  throw new Error(`Missing OAuth credentials file: ${CREDENTIALS_PATH}`);
+// ================= CREDENTIALS (env or file) =================
+// On Railway: set CREDENTIALS_JSON and TOKEN_JSON as environment variables
+// Locally: uses oauth_credentials.json and token.json files
+
+function loadCredentials() {
+  if (process.env.CREDENTIALS_JSON) {
+    console.log("✅ Loading credentials from CREDENTIALS_JSON env variable");
+    return JSON.parse(process.env.CREDENTIALS_JSON);
+  }
+  const filePath = path.join(__dirname, "oauth_credentials.json");
+  if (fs.existsSync(filePath)) {
+    console.log("✅ Loading credentials from oauth_credentials.json");
+    return JSON.parse(fs.readFileSync(filePath));
+  }
+  throw new Error("Missing credentials: set CREDENTIALS_JSON env variable or provide oauth_credentials.json");
 }
 
-const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH));
-const { client_secret, client_id } = credentials.installed || credentials.web;
+function loadToken() {
+  if (process.env.TOKEN_JSON) {
+    console.log("✅ Loading token from TOKEN_JSON env variable");
+    return JSON.parse(process.env.TOKEN_JSON);
+  }
+  const filePath = path.join(__dirname, "token.json");
+  if (fs.existsSync(filePath)) {
+    console.log("✅ Loading token from token.json");
+    return JSON.parse(fs.readFileSync(filePath));
+  }
+  return null;
+}
 
+function saveToken(tokens) {
+  if (!process.env.CREDENTIALS_JSON) {
+    // Local dev — persist to file
+    const filePath = path.join(__dirname, "token.json");
+    const current = fs.existsSync(filePath) ? JSON.parse(fs.readFileSync(filePath)) : {};
+    fs.writeFileSync(filePath, JSON.stringify({ ...current, ...tokens }));
+    console.log("🔄 Token saved to token.json");
+  } else {
+    // Railway — token is kept in memory only
+    // If you need to persist after restart, update TOKEN_JSON variable manually
+    console.log("🔄 Token refreshed in memory (Railway mode)");
+  }
+}
+
+const credentials = loadCredentials();
+const { client_secret, client_id } = credentials.installed || credentials.web;
 const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, REDIRECT_URI);
 
-if (fs.existsSync(TOKEN_PATH)) {
-  const token = JSON.parse(fs.readFileSync(TOKEN_PATH));
-  oAuth2Client.setCredentials(token);
-  console.log("✅ Token loaded from token.json");
+const savedToken = loadToken();
+if (savedToken) {
+  oAuth2Client.setCredentials(savedToken);
+  console.log("✅ Token loaded successfully");
 }
 
 oAuth2Client.on("tokens", (tokens) => {
-  const current = fs.existsSync(TOKEN_PATH)
-    ? JSON.parse(fs.readFileSync(TOKEN_PATH))
-    : {};
-  fs.writeFileSync(TOKEN_PATH, JSON.stringify({ ...current, ...tokens }));
-  console.log("🔄 Token refreshed and saved.");
+  const current = oAuth2Client.credentials || {};
+  const merged  = { ...current, ...tokens };
+  oAuth2Client.setCredentials(merged);
+  saveToken(merged);
 });
 
 // ================= MIDDLEWARE =================
@@ -70,7 +106,7 @@ app.get("/oauth2callback", async (req, res) => {
   try {
     const { tokens } = await oAuth2Client.getToken(code);
     oAuth2Client.setCredentials(tokens);
-    fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens));
+    saveToken(tokens);
     console.log("✅ Token saved — authorization complete!");
     res.send(`
       <html>
@@ -98,8 +134,6 @@ app.get("/testAuth", (req, res) => {
 });
 
 // ================= APPS SCRIPT HELPER =================
-// Called after form creation — links form to central spreadsheet
-// Runs in background, does NOT block the response to Android
 async function linkFormToSpreadsheet(formId) {
   try {
     console.log(`🔗 Linking formId=${formId} to central spreadsheet...`);
@@ -250,9 +284,7 @@ app.post("/createForm", async (req, res) => {
     console.log("CALL 1: Creating form...");
     const createRes = await formsApi.forms.create({
       requestBody: {
-        info: {
-          title: `Évaluation Formation - ${themeNom}`
-        }
+        info: { title: `Évaluation Formation - ${themeNom}` }
       }
     });
 
@@ -264,7 +296,7 @@ app.post("/createForm", async (req, res) => {
     let idx = 0;
     const requests = [];
 
-    // Set form description via batchUpdate
+    // Set description
     requests.push({
       updateFormInfo: {
         info: {
@@ -310,7 +342,7 @@ app.post("/createForm", async (req, res) => {
     requests.push(paragraphItem("Avez-vous des propositions et des suggestions d'amélioration ?", "Vos suggestions...", idx++));
     requests.push(dateItem("Date de l'évaluation", idx++));
 
-    // ── CALL 2: batchUpdate — add all questions ──────────────────
+    // ── CALL 2: batchUpdate ──────────────────────────────────────
     console.log("CALL 2: Adding questions...");
     const t1 = Date.now();
 
@@ -321,7 +353,7 @@ app.post("/createForm", async (req, res) => {
 
     console.log(`CALL 2 ✅ Questions added (${Date.now() - t1}ms)`);
 
-    // ── Extract entry IDs from batchUpdate response ───────────────
+    // ── Extract entry IDs from batchUpdate response ──────────────
     const titleToKey = {
       "Formation ID"        : "formationId",
       "Intitulé de l'action": "intituleAction",
@@ -359,11 +391,9 @@ app.post("/createForm", async (req, res) => {
 
     console.log(`✅ Done in ${Date.now() - t0}ms — entryIds:`, entryIds);
 
-    // ── Link form to central spreadsheet (background, non-blocking)
-    // Android gets the response immediately, linkForm runs after
+    // Link form to spreadsheet in background
     linkFormToSpreadsheet(formId);
 
-    // ── Return response to Android ───────────────────────────────
     return res.json({
       status         : "success",
       formUrl,
