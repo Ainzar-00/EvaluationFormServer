@@ -238,10 +238,81 @@ app.get("/oauth2callback", async (req, res) => {
   }
 });
 
+// ================= HELPERS =================
+
+/**
+ * The 7 visible questions to add to every evaluation form.
+ * Order matters — it determines the index used when reading back questionIds.
+ */
+const FORM_QUESTIONS = [
+  { key: "formationId",    title: "ID Formation",       type: "SHORT_ANSWER" },
+  { key: "intituleAction", title: "Intitulé de l'action de formation", type: "SHORT_ANSWER" },
+  { key: "nomPrenom",      title: "Nom et Prénom",       type: "SHORT_ANSWER" },
+  { key: "matricule",      title: "Matricule",           type: "SHORT_ANSWER" },
+  { key: "service",        title: "Service",             type: "SHORT_ANSWER" },
+  { key: "formateur",      title: "Formateur",           type: "SHORT_ANSWER" },
+  { key: "dates",          title: "Dates de formation",  type: "SHORT_ANSWER" },
+];
+
+/**
+ * Build a batchUpdate request body that appends all 7 questions to the form.
+ */
+function buildAddQuestionsRequest() {
+  return {
+    requests: FORM_QUESTIONS.map((q, index) => ({
+      createItem: {
+        item: {
+          title: q.title,
+          questionItem: {
+            question: {
+              required: false,
+              textQuestion: {
+                paragraph: false  // SHORT_ANSWER = single line
+              }
+            }
+          }
+        },
+        location: { index }
+      }
+    }))
+  };
+}
+
+/**
+ * After batchUpdate, fetch the form and extract questionIds in order.
+ * Returns an object like: { formationId: "entry.123456", ... }
+ */
+function extractEntryIds(formData) {
+  const entryIds = {};
+
+  // formData.items is ordered — matches the insertion order above
+  (formData.items || []).forEach((item, i) => {
+    const key = FORM_QUESTIONS[i]?.key;
+    const questionId = item?.questionItem?.question?.questionId;
+    if (key && questionId) {
+      // Google prefill URL format uses "entry." prefix
+      entryIds[key] = "entry." + questionId;
+    }
+  });
+
+  return entryIds;
+}
+
+/**
+ * Build a prefilled Google Form URL with empty placeholders for each field.
+ * Android app will substitute real values before opening the URL.
+ */
+function buildFormUrl(formId, entryIds) {
+  const base = `https://docs.google.com/forms/d/${formId}/viewform`;
+  const params = Object.values(entryIds)
+    .map(entryId => `${encodeURIComponent(entryId)}=`)
+    .join("&");
+  return `${base}?${params}`;
+}
+
 // ================= MAIN =================
 
 app.post("/createForm", async (req, res) => {
-  // FIX 7: Validate input before proceeding
   const { themeNom } = req.body;
   if (!themeNom || typeof themeNom !== "string" || !themeNom.trim()) {
     return res.status(400).json({
@@ -254,18 +325,45 @@ app.post("/createForm", async (req, res) => {
     await ensureValidToken();
 
     const formsApi = google.forms({ version: "v1", auth: oAuth2Client });
+    const title = "Evaluation Formation - " + themeNom.trim();
 
-    console.log("🚀 Creating form for theme:", themeNom);
-
+    // ── Step 1: Create the blank form ──────────────────────────────────────
+    console.log("🚀 [1/3] Creating form:", title);
     const createRes = await formsApi.forms.create({
-      requestBody: {
-        info: { title: "Evaluation Formation - " + themeNom.trim() }
-      }
+      requestBody: { info: { title } }
     });
+    const formId = createRes.data.formId;
+    console.log("✅ Form created:", formId);
+
+    // ── Step 2: Add the 7 visible questions ────────────────────────────────
+    console.log("📝 [2/3] Adding questions...");
+    await formsApi.forms.batchUpdate({
+      formId,
+      requestBody: buildAddQuestionsRequest()
+    });
+    console.log("✅ Questions added");
+
+    // ── Step 3: Fetch the form to read back questionIds → entryIds ─────────
+    console.log("🔍 [3/3] Reading back questionIds...");
+    const formData = await formsApi.forms.get({ formId });
+    const entryIds = extractEntryIds(formData.data);
+    console.log("✅ Entry IDs:", entryIds);
+
+    // Warn if any field is missing (mis-indexed)
+    const missingKeys = FORM_QUESTIONS.map(q => q.key).filter(k => !entryIds[k]);
+    if (missingKeys.length > 0) {
+      console.warn("⚠️  Missing entryIds for:", missingKeys);
+    }
+
+    const formUrl = buildFormUrl(formId, entryIds);
+    console.log("🔗 Form URL:", formUrl);
 
     return res.json({
-      status: "success",
-      formId: createRes.data.formId
+      status:    "success",
+      formId,
+      formUrl,
+      entryIds,
+      // responseSheetId intentionally omitted — handled by your Apps Script
     });
 
   } catch (err) {
@@ -280,7 +378,7 @@ app.post("/createForm", async (req, res) => {
       }
     }
 
-    console.error("🔥 createForm error:", err.message);
+    console.error("🔥 createForm error:", err.message, err.stack);
     return res.status(500).json({ status: "error", message: err.message });
   }
 });
