@@ -189,7 +189,7 @@ app.post("/createForm", async (req, res) => {
 
     const createRes = await formsApi.forms.create({
       requestBody: {
-        info: { title: `Évaluation Formation - ${themeNom}` }
+        info: { title: "Evaluation Formation - " + themeNom }
       }
     });
 
