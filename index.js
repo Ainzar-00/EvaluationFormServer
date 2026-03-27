@@ -1,4 +1,3 @@
-```js
 const express = require("express");
 const path = require("path");
 const fs = require("fs");
@@ -14,7 +13,13 @@ const SCOPES = [
 
 const CENTRAL_SHEET_ID = "1Wj0LzFPa5esKLCjGW_UfsdYUAtOIJ-YnhKiCA8X9o44";
 const APPS_SCRIPT_URL  = "https://script.google.com/macros/s/AKfycbwxFrbzD1aTkAbUaydrZ_05U9RR4qH5xUcjTRFaPAE981ToOJ1r95TWYxfW4IIX_Kfo/exec";
-const REDIRECT_URI     = process.env.REDIRECT_URI || "http://localhost:8080/oauth2callback";
+
+// FIX 1: REDIRECT_URI must be set via env var in production (Cloud Functions URL).
+//         Never fall back to localhost in production — OAuth will silently fail.
+const REDIRECT_URI = process.env.REDIRECT_URI;
+if (!REDIRECT_URI) {
+  console.warn("⚠️  WARNING: REDIRECT_URI env var is not set. OAuth callbacks will fail.");
+}
 
 // ================= LOADERS =================
 
@@ -30,20 +35,32 @@ function loadCredentials() {
     return JSON.parse(fs.readFileSync(filePath, "utf8"));
   }
 
-  throw new Error("Missing credentials");
+  throw new Error("❌ Missing credentials: set CREDENTIALS_JSON env var or provide oauth_credentials.json");
 }
 
 function loadToken() {
+  // FIX 2: Prioritize ENV token in production (Cloud Functions has no persistent disk).
+  //         File-based token only works locally.
   try {
     if (process.env.TOKEN_JSON) {
       console.log("✅ Loading token from ENV");
-      return JSON.parse(process.env.TOKEN_JSON);
+      const token = JSON.parse(process.env.TOKEN_JSON);
+      if (!token.access_token && !token.refresh_token) {
+        console.warn("⚠️  TOKEN_JSON exists but contains no usable tokens");
+        return null;
+      }
+      return token;
     }
 
     const filePath = path.join(__dirname, "token.json");
     if (fs.existsSync(filePath)) {
       console.log("✅ Loading token from file");
-      return JSON.parse(fs.readFileSync(filePath, "utf8"));
+      const token = JSON.parse(fs.readFileSync(filePath, "utf8"));
+      if (!token.access_token && !token.refresh_token) {
+        console.warn("⚠️  token.json exists but contains no usable tokens");
+        return null;
+      }
+      return token;
     }
   } catch (err) {
     console.error("❌ Token parse error:", err.message);
@@ -53,12 +70,21 @@ function loadToken() {
 }
 
 function saveToken(tokens) {
+  // FIX 3: On Cloud Functions, the filesystem is ephemeral — log the token so you
+  //         can copy it into the TOKEN_JSON env var manually after first auth.
+  if (process.env.K_SERVICE) {
+    // Running on Cloud Functions/Cloud Run — filesystem writes won't persist
+    console.log("☁️  Running on Cloud — token cannot be saved to disk.");
+    console.log("📋 Copy this token into your TOKEN_JSON env var:\n", JSON.stringify(tokens));
+    return;
+  }
+
   try {
     fs.writeFileSync(
       path.join(__dirname, "token.json"),
       JSON.stringify(tokens, null, 2)
     );
-    console.log("🔄 Token saved locally");
+    console.log("💾 Token saved locally");
   } catch (err) {
     console.error("❌ Save token failed:", err.message);
   }
@@ -76,43 +102,59 @@ const oAuth2Client = new google.auth.OAuth2(
 );
 
 const savedToken = loadToken();
-
 if (savedToken) {
   oAuth2Client.setCredentials(savedToken);
-  console.log("✅ Token loaded");
-  console.log("🧾 Info:", {
+  console.log("✅ Token loaded", {
     hasAccessToken: !!savedToken.access_token,
     hasRefreshToken: !!savedToken.refresh_token,
     expiry: savedToken.expiry_date
+      ? new Date(savedToken.expiry_date).toISOString()
+      : "unknown"
   });
 }
 
-// auto-save refreshed tokens
+// FIX 4: Don't manually merge credentials — the library already updates
+//         oAuth2Client.credentials internally before emitting the 'tokens' event.
+//         Just save whatever the client now holds.
 oAuth2Client.on("tokens", (tokens) => {
+  // Merge new tokens with existing ones (important to preserve refresh_token
+  // since Google only sends it on first authorization)
   const merged = { ...oAuth2Client.credentials, ...tokens };
   oAuth2Client.setCredentials(merged);
   saveToken(merged);
-  console.log("🔄 Token refreshed");
+  console.log("🔄 Token refreshed and saved");
 });
 
 // ================= AUTH =================
 
 function getAuthUrl() {
+  if (!REDIRECT_URI) {
+    throw new Error("Cannot generate auth URL: REDIRECT_URI env var is not set");
+  }
   return oAuth2Client.generateAuthUrl({
     access_type: "offline",
     scope: SCOPES,
-    prompt: "consent",
+    prompt: "consent", // forces refresh_token to be returned every time
   });
 }
 
+// FIX 5: Properly detect missing vs. expired tokens and trigger refresh correctly.
 async function ensureValidToken() {
+  const creds = oAuth2Client.credentials;
+
+  // No credentials at all — user must go through OAuth flow
+  if (!creds || (!creds.access_token && !creds.refresh_token)) {
+    throw new Error("AUTH_REQUIRED");
+  }
+
   try {
-    const token = await oAuth2Client.getAccessToken();
-    if (!token || !token.token) {
-      throw new Error("No token");
+    // getAccessToken() auto-refreshes using refresh_token if access_token is expired
+    const tokenResponse = await oAuth2Client.getAccessToken();
+    if (!tokenResponse || !tokenResponse.token) {
+      throw new Error("Empty token response");
     }
   } catch (err) {
-    console.error("❌ Auth failed:", err.message);
+    console.error("❌ Token validation/refresh failed:", err.message);
     throw new Error("AUTH_REQUIRED");
   }
 }
@@ -134,62 +176,90 @@ app.use((req, res, next) => {
 app.get("/", (req, res) => res.send("Server running ✅"));
 
 app.get("/testAuth", (req, res) => {
-  if (oAuth2Client.credentials?.access_token) {
+  const creds = oAuth2Client.credentials;
+  if (creds?.access_token || creds?.refresh_token) {
     res.json({
       status: "ok",
-      expiry: oAuth2Client.credentials.expiry_date
+      hasAccessToken: !!creds.access_token,
+      hasRefreshToken: !!creds.refresh_token,
+      expiry: creds.expiry_date
+        ? new Date(creds.expiry_date).toISOString()
+        : "unknown"
     });
   } else {
-    res.json({
-      status: "not_authorized",
-      authUrl: getAuthUrl()
-    });
+    try {
+      res.json({ status: "not_authorized", authUrl: getAuthUrl() });
+    } catch (err) {
+      res.status(500).json({ status: "error", message: err.message });
+    }
   }
 });
 
 app.get("/debugToken", (req, res) => {
+  const creds = oAuth2Client.credentials;
   res.json({
-    credentials: oAuth2Client.credentials,
-    hasAccessToken: !!oAuth2Client.credentials?.access_token,
-    hasRefreshToken: !!oAuth2Client.credentials?.refresh_token,
+    hasAccessToken: !!creds?.access_token,
+    hasRefreshToken: !!creds?.refresh_token,
+    expiry: creds?.expiry_date
+      ? new Date(creds.expiry_date).toISOString()
+      : "unknown"
   });
 });
 
 // ================= OAUTH CALLBACK =================
 
 app.get("/oauth2callback", async (req, res) => {
+  const { code, error } = req.query;
+
+  // FIX 6: Handle OAuth errors returned by Google (e.g. user denied access)
+  if (error) {
+    console.error("❌ OAuth denied by user:", error);
+    return res.status(400).send(`Authorization denied: ${error}`);
+  }
+
+  if (!code) {
+    return res.status(400).send("Missing authorization code");
+  }
+
   try {
-    const { tokens } = await oAuth2Client.getToken(req.query.code);
+    const { tokens } = await oAuth2Client.getToken(code);
     oAuth2Client.setCredentials(tokens);
     saveToken(tokens);
 
-    console.log("✅ New token generated");
+    console.log("✅ New token generated", {
+      hasAccessToken: !!tokens.access_token,
+      hasRefreshToken: !!tokens.refresh_token
+    });
 
     res.send("Authorization successful. You can close this tab.");
   } catch (err) {
-    console.error("❌ OAuth error:", err.message);
-    res.status(500).send("Auth failed");
+    console.error("❌ OAuth callback error:", err.message);
+    res.status(500).send("Authorization failed: " + err.message);
   }
 });
 
 // ================= MAIN =================
 
 app.post("/createForm", async (req, res) => {
+  // FIX 7: Validate input before proceeding
+  const { themeNom } = req.body;
+  if (!themeNom || typeof themeNom !== "string" || !themeNom.trim()) {
+    return res.status(400).json({
+      status: "error",
+      message: "themeNom is required and must be a non-empty string"
+    });
+  }
+
   try {
     await ensureValidToken();
 
-    const { themeNom } = req.body;
+    const formsApi = google.forms({ version: "v1", auth: oAuth2Client });
 
-    const formsApi = google.forms({
-      version: "v1",
-      auth: oAuth2Client
-    });
-
-    console.log("🚀 Creating form...");
+    console.log("🚀 Creating form for theme:", themeNom);
 
     const createRes = await formsApi.forms.create({
       requestBody: {
-        info: { title: "Evaluation Formation - " + themeNom }
+        info: { title: "Evaluation Formation - " + themeNom.trim() }
       }
     });
 
@@ -199,34 +269,42 @@ app.post("/createForm", async (req, res) => {
     });
 
   } catch (err) {
-
     if (err.message === "AUTH_REQUIRED") {
-      return res.status(401).json({
-        status: "unauthorized",
-        authUrl: getAuthUrl()
-      });
+      try {
+        return res.status(401).json({ status: "unauthorized", authUrl: getAuthUrl() });
+      } catch (urlErr) {
+        return res.status(401).json({
+          status: "unauthorized",
+          message: "Auth required but REDIRECT_URI is not configured"
+        });
+      }
     }
 
-    console.error("🔥 ERROR:", err.message);
-
-    return res.status(500).json({
-      status: "error",
-      message: err.message
-    });
+    console.error("🔥 createForm error:", err.message);
+    return res.status(500).json({ status: "error", message: err.message });
   }
 });
 
 // ================= START =================
 
-const PORT = process.env.PORT || 8080;
+// FIX 8: Only call app.listen() when running locally.
+//         On Cloud Functions, the framework manages the HTTP server — calling
+//         app.listen() will crash the function or cause port conflicts.
+const isCloudFunction = !!process.env.K_SERVICE || !!process.env.FUNCTION_TARGET;
 
-app.listen(PORT, () => {
-  console.log(`Server running on ${PORT}`);
-  console.log("🔐 Auth URL:", getAuthUrl());
-});
+if (!isCloudFunction) {
+  const PORT = process.env.PORT || 8080;
+  app.listen(PORT, () => {
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
+    try {
+      console.log("🔐 Auth URL:", getAuthUrl());
+    } catch {
+      console.warn("⚠️  Could not generate auth URL (REDIRECT_URI not set)");
+    }
+  });
+}
 
 // ================= EXPORT =================
 
 const functions = require("@google-cloud/functions-framework");
 functions.http("myHttpFunction", app);
-```
