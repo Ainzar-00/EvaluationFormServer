@@ -64,21 +64,21 @@ function loadToken() {
   return null;
 }
 
-// MERGED FIX (from Doc2): Use K_SERVICE to detect Cloud Functions (the correct standard env var).
-//             Doc1 was checking CREDENTIALS_JSON which is unrelated to the runtime environment.
+// Railway: The filesystem is writable while the container is running but resets
+// on every redeploy. Strategy:
+//   1. Always write to token.json so in-session refreshes work without an extra API call.
+//   2. Always log the token so you can paste it into TOKEN_JSON in Railway's env vars
+//      (Dashboard → your service → Variables) to survive redeploys.
 function saveToken(tokens) {
-  if (process.env.K_SERVICE) {
-    console.log("☁️  Running on Cloud — token cannot be saved to disk.");
-    console.log("📋 Copy this token into your TOKEN_JSON env var:\n", JSON.stringify(tokens));
-    return;
-  }
   try {
     const filePath = path.join(__dirname, "token.json");
     fs.writeFileSync(filePath, JSON.stringify(tokens, null, 2));
-    console.log("💾 Token saved locally");
+    console.log("💾 Token saved to token.json (current session only)");
   } catch (err) {
     console.error("❌ Save token failed:", err.message);
   }
+  // Always print — copy this into TOKEN_JSON on Railway after first auth.
+  console.log("📋 [Railway] Paste into TOKEN_JSON env var:\n" + JSON.stringify(tokens));
 }
 
 // ================= OAUTH CLIENT =================
@@ -551,27 +551,17 @@ app.post("/createForm", async (req, res) => {
 });
 
 // ================= START =================
-
-// MERGED FIX (from Doc2): Don't call app.listen() on Cloud Functions — the framework
-//             manages the HTTP server. Calling it there causes port conflicts or crashes.
-const isCloudFunction = !!process.env.K_SERVICE || !!process.env.FUNCTION_TARGET;
-
-if (!isCloudFunction) {
-  const PORT = process.env.PORT || 8080;
-  app.listen(PORT, () => {
-    console.log(`🚀 Server running on http://localhost:${PORT}`);
-    try {
-      if (!oAuth2Client.credentials?.access_token && !oAuth2Client.credentials?.refresh_token) {
-        console.log("🔐 Not authorized yet — open this URL in your browser:");
-        console.log(getAuthUrl());
-      }
-    } catch (err) {
-      console.warn("⚠️  Could not generate auth URL:", err.message);
+// Railway manages the process directly — just call app.listen().
+// Railway injects PORT automatically; 8080 is the local dev fallback.
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  try {
+    if (!oAuth2Client.credentials?.access_token && !oAuth2Client.credentials?.refresh_token) {
+      console.log("🔐 Not authorized yet — open this URL in your browser:");
+      console.log(getAuthUrl());
     }
-  });
-}
-
-// ================= EXPORT =================
-
-const functions = require("@google-cloud/functions-framework");
-functions.http("myHttpFunction", app);
+  } catch (err) {
+    console.warn("⚠️  Could not generate auth URL:", err.message);
+  }
+});
