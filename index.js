@@ -1,6 +1,6 @@
-const express = require("express");
-const path    = require("path");
-const fs      = require("fs");
+const express    = require("express");
+const path       = require("path");
+const fs         = require("fs");
 const { google } = require("googleapis");
 
 const app = express();
@@ -8,134 +8,45 @@ const app = express();
 // ================= CONFIG =================
 const SCOPES = [
   "https://www.googleapis.com/auth/forms.body",
-  "https://www.googleapis.com/auth/drive"
+  "https://www.googleapis.com/auth/drive",
 ];
 
 const CENTRAL_SHEET_ID = "13C-zqx2hkSTu2P63eNsYjOONUOHZUqym58ZMMmJmYqw";
-const APPS_SCRIPT_URL  = "https://script.google.com/macros/s/AKfycbxg27IYiHhP9MXxbvFgzjwM72PIZb7yPbafA9gHTnmCwPCHdlR1gHPQaBs4nbUxazM7/exec";
 
-// MERGED FIX: Use env var in production; fall back to localhost WITH /oauth2callback path.
-//             Doc2 was missing the /oauth2callback path — that breaks the OAuth flow.
-const REDIRECT_URI = process.env.REDIRECT_URI || "http://localhost:8080/oauth2callback";
-if (!process.env.REDIRECT_URI) {
-  console.warn("⚠️  REDIRECT_URI not set — using localhost fallback (local dev only)");
-}
+// Apps Script web app — must be deployed with "Who has access: Anyone, even anonymous"
+// because service accounts cannot authenticate against Apps Script web apps.
+const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxg27IYiHhP9MXxbvFgzjwM72PIZb7yPbafA9gHTnmCwPCHdlR1gHPQaBs4nbUxazM7/exec";
 
-// ================= CREDENTIALS =================
+// ================= SERVICE ACCOUNT AUTH =================
+// Set SERVICE_ACCOUNT_JSON on Railway (Dashboard → your service → Variables)
+// to the full contents of your service account key JSON file.
+// Locally, place the file at service_account.json.
 
-function loadCredentials() {
-  if (process.env.CREDENTIALS_JSON) {
-    console.log("✅ Loading credentials from ENV");
-    return JSON.parse(process.env.CREDENTIALS_JSON);
+function loadServiceAccount() {
+  if (process.env.SERVICE_ACCOUNT_JSON) {
+    console.log("✅ Loading service account from SERVICE_ACCOUNT_JSON env var");
+    return JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
   }
-  const filePath = path.join(__dirname, "oauth_credentials.json");
+  const filePath = path.join(__dirname, "service_account.json");
   if (fs.existsSync(filePath)) {
-    console.log("✅ Loading credentials from file");
+    console.log("✅ Loading service account from service_account.json");
     return JSON.parse(fs.readFileSync(filePath, "utf8"));
   }
-  throw new Error("❌ Missing credentials: set CREDENTIALS_JSON env var or provide oauth_credentials.json");
+  throw new Error(
+    "❌ Missing service account: set SERVICE_ACCOUNT_JSON env var or provide service_account.json"
+  );
 }
 
-// MERGED FIX (from Doc2): Validate token contents and wrap in try/catch.
-function loadToken() {
-  try {
-    if (process.env.TOKEN_JSON) {
-      console.log("✅ Loading token from ENV");
-      const token = JSON.parse(process.env.TOKEN_JSON);
-      if (!token.access_token && !token.refresh_token) {
-        console.warn("⚠️  TOKEN_JSON exists but contains no usable tokens");
-        return null;
-      }
-      return token;
-    }
-    const filePath = path.join(__dirname, "token.json");
-    if (fs.existsSync(filePath)) {
-      console.log("✅ Loading token from file");
-      const token = JSON.parse(fs.readFileSync(filePath, "utf8"));
-      if (!token.access_token && !token.refresh_token) {
-        console.warn("⚠️  token.json exists but contains no usable tokens");
-        return null;
-      }
-      return token;
-    }
-  } catch (err) {
-    console.error("❌ Token parse error:", err.message);
-  }
-  return null;
-}
+const serviceAccountKey = loadServiceAccount();
 
-// Railway: The filesystem is writable while the container is running but resets
-// on every redeploy. Strategy:
-//   1. Always write to token.json so in-session refreshes work without an extra API call.
-//   2. Always log the token so you can paste it into TOKEN_JSON in Railway's env vars
-//      (Dashboard → your service → Variables) to survive redeploys.
-function saveToken(tokens) {
-  try {
-    const filePath = path.join(__dirname, "token.json");
-    fs.writeFileSync(filePath, JSON.stringify(tokens, null, 2));
-    console.log("💾 Token saved to token.json (current session only)");
-  } catch (err) {
-    console.error("❌ Save token failed:", err.message);
-  }
-  // Always print — copy this into TOKEN_JSON on Railway after first auth.
-  console.log("📋 [Railway] Paste into TOKEN_JSON env var:\n" + JSON.stringify(tokens));
-}
-
-// ================= OAUTH CLIENT =================
-
-const credentials = loadCredentials();
-const { client_secret, client_id } = credentials.installed || credentials.web;
-
-const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, REDIRECT_URI);
-
-const savedToken = loadToken();
-if (savedToken) {
-  oAuth2Client.setCredentials(savedToken);
-  console.log("✅ Token loaded", {
-    hasAccessToken : !!savedToken.access_token,
-    hasRefreshToken: !!savedToken.refresh_token,
-    expiry         : savedToken.expiry_date
-      ? new Date(savedToken.expiry_date).toISOString()
-      : "unknown"
-  });
-}
-
-// MERGED FIX (from Doc2): Merge into oAuth2Client.credentials to preserve refresh_token,
-//             which Google only sends on the very first authorization.
-oAuth2Client.on("tokens", (tokens) => {
-  const merged = { ...oAuth2Client.credentials, ...tokens };
-  oAuth2Client.setCredentials(merged);
-  saveToken(merged);
-  console.log("🔄 Token refreshed and saved");
+// GoogleAuth handles token generation and auto-refresh transparently.
+// No callback URL, no token storage, no manual refresh — it just works.
+const auth = new google.auth.GoogleAuth({
+  credentials: serviceAccountKey,
+  scopes     : SCOPES,
 });
 
-// ================= AUTH HELPERS =================
-
-function getAuthUrl() {
-  return oAuth2Client.generateAuthUrl({
-    access_type: "offline",
-    scope      : SCOPES,
-    prompt     : "consent", // forces refresh_token on every auth
-  });
-}
-
-// MERGED FIX (from Doc2): Replace simple isAuthorized() with a proper async check that
-//             actually attempts a token refresh before declaring the session invalid.
-async function ensureValidToken() {
-  const creds = oAuth2Client.credentials;
-  if (!creds || (!creds.access_token && !creds.refresh_token)) {
-    throw new Error("AUTH_REQUIRED");
-  }
-  try {
-    const tokenResponse = await oAuth2Client.getAccessToken();
-    if (!tokenResponse || !tokenResponse.token) {
-      throw new Error("Empty token response");
-    }
-  } catch (err) {
-    console.error("❌ Token validation/refresh failed:", err.message);
-    throw new Error("AUTH_REQUIRED");
-  }
-}
+console.log(`✅ Service account ready: ${serviceAccountKey.client_email}`);
 
 // ================= MIDDLEWARE =================
 
@@ -153,86 +64,32 @@ app.use((req, res, next) => {
 
 app.get("/", (req, res) => res.send("Server is running ✅"));
 
+// Health-check: verifies the service account can obtain an access token.
 app.get("/testAuth", async (req, res) => {
-  const creds = oAuth2Client.credentials;
-  if (creds?.access_token || creds?.refresh_token) {
-    res.json({
-      status         : "ok",
-      hasAccessToken : !!creds.access_token,
-      hasRefreshToken: !!creds.refresh_token,
-      expiry         : creds.expiry_date
-        ? new Date(creds.expiry_date).toISOString()
-        : "unknown"
-    });
-  } else {
-    try {
-      res.json({ status: "not_authorized", authUrl: getAuthUrl() });
-    } catch (err) {
-      res.status(500).json({ status: "error", message: err.message });
-    }
-  }
-});
-
-// MERGED (from Doc2): Useful for quick token inspection during debugging.
-app.get("/debugToken", (req, res) => {
-  const creds = oAuth2Client.credentials;
-  res.json({
-    hasAccessToken : !!creds?.access_token,
-    hasRefreshToken: !!creds?.refresh_token,
-    expiry         : creds?.expiry_date
-      ? new Date(creds.expiry_date).toISOString()
-      : "unknown"
-  });
-});
-
-// ================= OAUTH CALLBACK =================
-
-app.get("/oauth2callback", async (req, res) => {
-  const { code, error } = req.query;
-
-  // MERGED FIX (from Doc2): Handle the case where the user denied access.
-  if (error) {
-    console.error("❌ OAuth denied by user:", error);
-    return res.status(400).send(`Authorization denied: ${error}`);
-  }
-
-  if (!code) return res.status(400).send("Missing authorization code.");
-
   try {
-    const { tokens } = await oAuth2Client.getToken(code);
-    oAuth2Client.setCredentials(tokens);
-    saveToken(tokens);
-    console.log("✅ New token generated", {
-      hasAccessToken : !!tokens.access_token,
-      hasRefreshToken: !!tokens.refresh_token
+    const client      = await auth.getClient();
+    const tokenResult = await client.getAccessToken();
+    res.json({
+      status      : "ok",
+      client_email: serviceAccountKey.client_email,
+      hasToken    : !!tokenResult?.token,
     });
-    // MERGED (from Doc1): Nicer HTML confirmation page.
-    res.send(`
-      <html>
-        <body style="font-family:sans-serif;text-align:center;padding:50px">
-          <h2>✅ Authorization successful!</h2>
-          <p>You can close this tab and go back to your app.</p>
-        </body>
-      </html>
-    `);
   } catch (err) {
-    console.error("❌ OAuth callback error:", err.message);
-    res.status(500).send("Authorization failed: " + err.message);
+    res.status(500).json({ status: "error", message: err.message });
   }
 });
 
 // ================= APPS SCRIPT HELPER =================
-
-// Links the newly created form to the central spreadsheet via Apps Script.
-// FIX: Apps Script can return an HTML error page when the deployment is broken or
-//      the script throws. Always read as text first, then attempt JSON.parse() safely.
+// No Authorization header — the web app must be deployed as "Anyone, even anonymous".
+// Service accounts cannot authenticate against Apps Script web apps.
 async function linkFormToSpreadsheet(formId) {
   try {
     console.log(`🔗 Linking formId=${formId} to central spreadsheet...`);
-    const res  = await fetch(APPS_SCRIPT_URL, {
+
+    const res = await fetch(APPS_SCRIPT_URL, {
       method : "POST",
       headers: { "Content-Type": "application/json" },
-      body   : JSON.stringify({ action: "linkForm", formId })
+      body   : JSON.stringify({ action: "linkForm", formId }),
     });
 
     const text = await res.text();
@@ -241,8 +98,7 @@ async function linkFormToSpreadsheet(formId) {
     try {
       data = JSON.parse(text);
     } catch {
-      // Apps Script returned HTML (error page, login wall, stale deployment, etc.)
-      console.error(`🔗 ❌ linkForm: Apps Script returned non-JSON (HTTP ${res.status})`);
+      console.error(`🔗 ❌ Apps Script returned non-JSON (HTTP ${res.status})`);
       console.error(`🔗    First 300 chars: ${text.slice(0, 300)}`);
       return;
     }
@@ -258,7 +114,6 @@ async function linkFormToSpreadsheet(formId) {
 }
 
 // ================= ITEM BUILDERS =================
-// MERGED (from Doc1): Full set of question-type builders for the complete evaluation form.
 
 function lockedTextItem(title, helpText, idx) {
   return {
@@ -370,7 +225,7 @@ function dateItem(title, idx) {
 }
 
 // ================= ENTRY ID MAP =================
-// Maps form question titles to the response object keys returned to the client.
+
 const TITLE_TO_KEY = {
   "Formation ID"         : "formationId",
   "Intitulé de l'action" : "intituleAction",
@@ -389,23 +244,19 @@ app.post("/createForm", async (req, res) => {
   if (!themeNom || typeof themeNom !== "string" || !themeNom.trim()) {
     return res.status(400).json({
       status : "error",
-      message: "themeNom is required and must be a non-empty string"
+      message: "themeNom is required and must be a non-empty string",
     });
   }
 
   try {
-    // MERGED FIX: Use the robust token-refresh check from Doc2 instead of the
-    //             simple isAuthorized() boolean from Doc1.
-    await ensureValidToken();
-
-    const formsApi = google.forms({ version: "v1", auth: oAuth2Client });
-    const t0    = Date.now();
-    const title = `Évaluation Formation - ${themeNom.trim()}`;
+    const formsApi = google.forms({ version: "v1", auth });
+    const t0       = Date.now();
+    const title    = `Évaluation Formation - ${themeNom.trim()}`;
 
     // ── Step 1: Create blank form ──────────────────────────────────────────
     console.log("🚀 [1/3] Creating form:", title);
     const createRes = await formsApi.forms.create({
-      requestBody: { info: { title } }
+      requestBody: { info: { title } },
     });
     const formId  = createRes.data.formId;
     const formUrl = `https://docs.google.com/forms/d/${formId}/viewform`;
@@ -418,13 +269,13 @@ app.post("/createForm", async (req, res) => {
     requests.push({
       updateFormInfo: {
         info: {
-          description: "Il nous paraît tout aussi important d'apprécier la mise en pratique des formations qui ont été engagées pour votre collaborateur, avec quelques semaines de recul. C'est pourquoi nous vous remercions de bien vouloir retourner ce questionnaire dans les plus brefs délais à OIS/HID."
+          description:
+            "Il nous paraît tout aussi important d'apprécier la mise en pratique des formations qui ont été engagées pour votre collaborateur, avec quelques semaines de recul. C'est pourquoi nous vous remercions de bien vouloir retourner ce questionnaire dans les plus brefs délais à OIS/HID.",
         },
-        updateMask: "description"
-      }
+        updateMask: "description",
+      },
     });
 
-    // Prefilled / locked fields
     requests.push(lockedTextItem("Formation ID",          "🔒 Ne pas modifier",            idx++));
     requests.push(lockedTextItem("Intitulé de l'action",  "🔒 Pré-rempli automatiquement", idx++));
     requests.push(lockedTextItem("Collaborateur",         "🔒 Pré-rempli automatiquement", idx++));
@@ -433,12 +284,11 @@ app.post("/createForm", async (req, res) => {
     requests.push(lockedTextItem("Formateur",             "🔒 Pré-rempli automatiquement", idx++));
     requests.push(lockedTextItem("Date(s)",               "🔒 Pré-rempli automatiquement", idx++));
 
-    // Evaluation questions
-    requests.push(checkboxItem("Par quel moyen vous avez apprécié votre collaborateur ?", [
-      "Entretien",
-      "Mise en situation professionnelle/Observation",
-      "Autres à préciser"
-    ], false, idx++));
+    requests.push(checkboxItem(
+      "Par quel moyen vous avez apprécié votre collaborateur ?",
+      ["Entretien", "Mise en situation professionnelle/Observation", "Autres à préciser"],
+      false, idx++
+    ));
     requests.push(textItem("Autres à préciser", "", false, idx++));
     requests.push(radioItem("La formation choisie semblait satisfaire votre besoin", idx++));
     requests.push(radioItem("La formation a eu un impact sur la performance individuelle de votre collaborateur", idx++));
@@ -446,7 +296,7 @@ app.post("/createForm", async (req, res) => {
     requests.push(checkboxItem("Si non pourquoi ?", [
       "L'organisation du travail n'a pas permis de lui confier des tâches correspondant aux compétences acquises",
       "Le niveau de compétences acquis est insuffisant",
-      "La formation n'a pas porté sur les compétences nécessaires à l'atelier"
+      "La formation n'a pas porté sur les compétences nécessaires à l'atelier",
     ], false, idx++));
     requests.push(radioItem("Globalement quel est votre degré de satisfaction", idx++));
 
@@ -464,43 +314,36 @@ app.post("/createForm", async (req, res) => {
     const t1       = Date.now();
     const batchRes = await formsApi.forms.batchUpdate({
       formId,
-      requestBody: { requests }
+      requestBody: { requests },
     });
     console.log(`✅ Questions added (${Date.now() - t1}ms)`);
 
-    // ── Step 3: Extract entry IDs ──────────────────────────────────────────
-    // FIX: The batchUpdate reply structure for createItem is:
-    //        { createItem: { itemId: "...", questionId: ["..."] } }
-    //      The reply does NOT echo back the item title — it only has IDs.
-    //      We must match each reply back to its request BY POSITION.
-    //      Non-createItem requests (e.g. updateFormInfo) return an empty {} reply,
-    //      so we build an index map first, then walk replies in order.
+    // ── Step 3: Extract entry IDs by position ─────────────────────────────
+    // batchUpdate replies mirror requests 1-to-1.
+    // Reply shape: { createItem: { itemId, questionId: ["hexId"] } }
+    // Title is NOT echoed — match by request index.
     console.log("🔍 [3/3] Reading back questionIds...");
     const entryIds = {};
     const replies  = batchRes.data.replies || [];
 
-    // Map: request array index → key (only for the 7 prefilled/locked fields)
     const requestKeyByIndex = {};
     requests.forEach((req, i) => {
       if (req.createItem) {
-        const title = req.createItem.item?.title;
-        const key   = TITLE_TO_KEY[title];
+        const key = TITLE_TO_KEY[req.createItem.item?.title];
         if (key) requestKeyByIndex[i] = key;
       }
     });
 
-    // replies[i] corresponds 1-to-1 with requests[i]
     replies.forEach((reply, i) => {
-      const key        = requestKeyByIndex[i];
+      const key         = requestKeyByIndex[i];
       if (!key) return;
-      const questionIds = reply.createItem?.questionId;   // array of hex strings
+      const questionIds = reply.createItem?.questionId;
       if (Array.isArray(questionIds) && questionIds.length > 0) {
         entryIds[key] = parseInt(questionIds[0], 16);
       }
     });
 
-    // Fallback: if any IDs are still missing, do a GET on the form.
-    // This covers edge cases where the API omits questionIds in the reply.
+    // Fallback GET for any IDs still missing
     const missingTitles = Object.keys(TITLE_TO_KEY).filter(t => !entryIds[TITLE_TO_KEY[t]]);
     if (missingTitles.length > 0) {
       console.warn("⚠️  Falling back to GET for missing IDs:", missingTitles);
@@ -515,7 +358,7 @@ app.post("/createForm", async (req, res) => {
 
     console.log(`✅ Done in ${Date.now() - t0}ms — entryIds:`, entryIds);
 
-    // Link form to central spreadsheet in the background (non-blocking)
+    // Fire-and-forget — does not block the response
     linkFormToSpreadsheet(formId);
 
     return res.json({
@@ -527,17 +370,6 @@ app.post("/createForm", async (req, res) => {
     });
 
   } catch (err) {
-    if (err.message === "AUTH_REQUIRED") {
-      try {
-        return res.status(401).json({ status: "unauthorized", authUrl: getAuthUrl() });
-      } catch (urlErr) {
-        return res.status(401).json({
-          status : "unauthorized",
-          message: "Auth required but REDIRECT_URI is not configured"
-        });
-      }
-    }
-
     console.error("🔥 createForm error:", err.message);
     if (err.response) {
       console.error("📦 Google API error:", JSON.stringify(err.response.data, null, 2));
@@ -551,17 +383,7 @@ app.post("/createForm", async (req, res) => {
 });
 
 // ================= START =================
-// Railway manages the process directly — just call app.listen().
-// Railway injects PORT automatically; 8080 is the local dev fallback.
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  try {
-    if (!oAuth2Client.credentials?.access_token && !oAuth2Client.credentials?.refresh_token) {
-      console.log("🔐 Not authorized yet — open this URL in your browser:");
-      console.log(getAuthUrl());
-    }
-  } catch (err) {
-    console.warn("⚠️  Could not generate auth URL:", err.message);
-  }
 });
