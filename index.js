@@ -223,23 +223,37 @@ app.get("/oauth2callback", async (req, res) => {
 
 // ================= APPS SCRIPT HELPER =================
 
-// MERGED (from Doc1): Links the newly created form to the central spreadsheet via Apps Script.
+// Links the newly created form to the central spreadsheet via Apps Script.
+// FIX: Apps Script can return an HTML error page when the deployment is broken or
+//      the script throws. Always read as text first, then attempt JSON.parse() safely.
 async function linkFormToSpreadsheet(formId) {
   try {
     console.log(`🔗 Linking formId=${formId} to central spreadsheet...`);
-    const res = await fetch(APPS_SCRIPT_URL, {
+    const res  = await fetch(APPS_SCRIPT_URL, {
       method : "POST",
       headers: { "Content-Type": "application/json" },
       body   : JSON.stringify({ action: "linkForm", formId })
     });
-    const data = await res.json();
+
+    const text = await res.text();
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      // Apps Script returned HTML (error page, login wall, stale deployment, etc.)
+      console.error(`🔗 ❌ linkForm: Apps Script returned non-JSON (HTTP ${res.status})`);
+      console.error(`🔗    First 300 chars: ${text.slice(0, 300)}`);
+      return;
+    }
+
     if (data.status === "success") {
       console.log(`🔗 ✅ Form linked: ${data.title}`);
     } else {
       console.error(`🔗 ❌ linkForm failed:`, data.message);
     }
   } catch (err) {
-    console.error(`🔗 ❌ linkForm error:`, err.message);
+    console.error(`🔗 ❌ linkForm network error:`, err.message);
   }
 }
 
@@ -455,25 +469,41 @@ app.post("/createForm", async (req, res) => {
     console.log(`✅ Questions added (${Date.now() - t1}ms)`);
 
     // ── Step 3: Extract entry IDs ──────────────────────────────────────────
-    // MERGED: Try batchUpdate replies first (Doc1 approach), fall back to a
-    //         GET request (Doc2 approach) for any IDs that are missing.
+    // FIX: The batchUpdate reply structure for createItem is:
+    //        { createItem: { itemId: "...", questionId: ["..."] } }
+    //      The reply does NOT echo back the item title — it only has IDs.
+    //      We must match each reply back to its request BY POSITION.
+    //      Non-createItem requests (e.g. updateFormInfo) return an empty {} reply,
+    //      so we build an index map first, then walk replies in order.
     console.log("🔍 [3/3] Reading back questionIds...");
     const entryIds = {};
     const replies  = batchRes.data.replies || [];
 
-    replies.forEach(reply => {
-      const item = reply.createItem?.item;
-      if (!item) return;
-      const key = TITLE_TO_KEY[item.title];
-      if (!key) return;
-      const questionId = item.questionItem?.question?.questionId;
-      if (questionId) entryIds[key] = parseInt(questionId, 16);
+    // Map: request array index → key (only for the 7 prefilled/locked fields)
+    const requestKeyByIndex = {};
+    requests.forEach((req, i) => {
+      if (req.createItem) {
+        const title = req.createItem.item?.title;
+        const key   = TITLE_TO_KEY[title];
+        if (key) requestKeyByIndex[i] = key;
+      }
     });
 
-    // Fallback GET for any missing IDs
+    // replies[i] corresponds 1-to-1 with requests[i]
+    replies.forEach((reply, i) => {
+      const key        = requestKeyByIndex[i];
+      if (!key) return;
+      const questionIds = reply.createItem?.questionId;   // array of hex strings
+      if (Array.isArray(questionIds) && questionIds.length > 0) {
+        entryIds[key] = parseInt(questionIds[0], 16);
+      }
+    });
+
+    // Fallback: if any IDs are still missing, do a GET on the form.
+    // This covers edge cases where the API omits questionIds in the reply.
     const missingTitles = Object.keys(TITLE_TO_KEY).filter(t => !entryIds[TITLE_TO_KEY[t]]);
     if (missingTitles.length > 0) {
-      console.warn("⚠️  Missing IDs after batchUpdate, fetching form...", missingTitles);
+      console.warn("⚠️  Falling back to GET for missing IDs:", missingTitles);
       const formDetails = await formsApi.forms.get({ formId });
       (formDetails.data.items || []).forEach(item => {
         const key = TITLE_TO_KEY[item.title];
