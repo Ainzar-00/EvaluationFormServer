@@ -10,8 +10,9 @@ const SCOPES = [
   "https://www.googleapis.com/auth/forms.body",
   "https://www.googleapis.com/auth/drive"
 ];
+
 const CENTRAL_SHEET_ID = "1Wj0LzFPa5esKLCjGW_UfsdYUAtOIJ-YnhKiCA8X9o44";
-const APPS_SCRIPT_URL  = "https://script.google.com/macros/s/AKfycbwxFrbzD1aTkAbUaydrZ_05U9RR4qH5xUcjTRFaPAE981ToOJ1r95TWYxfW4IIX_Kfo/exec";
+const APPS_SCRIPT_URL  = "https://script.google.com/macros/s/AKfycbxg27IYiHhP9MXxbvFgzjwM72PIZb7yPbafA9gHTnmCwPCHdlR1gHPQaBs4nbUxazM7/exec";
 const REDIRECT_URI     = process.env.REDIRECT_URI || "http://localhost:8080/oauth2callback";
 
 // ================= CREDENTIALS (env or file) =================
