@@ -15,9 +15,7 @@ const CENTRAL_SHEET_ID = "13C-zqx2hkSTu2P63eNsYjOONUOHZUqym58ZMMmJmYqw";
 const APPS_SCRIPT_URL  = "https://script.google.com/macros/s/AKfycbxg27IYiHhP9MXxbvFgzjwM72PIZb7yPbafA9gHTnmCwPCHdlR1gHPQaBs4nbUxazM7/exec";
 const REDIRECT_URI     = process.env.REDIRECT_URI || "http://localhost:8080/oauth2callback";
 
-// ================= CREDENTIALS (env or file) =================
-// On Railway: set CREDENTIALS_JSON and TOKEN_JSON as environment variables
-// Locally: uses oauth_credentials.json and token.json files
+// ================= CREDENTIALS =================
 
 function loadCredentials() {
   if (process.env.CREDENTIALS_JSON) {
@@ -46,17 +44,16 @@ function loadToken() {
 }
 
 function saveToken(tokens) {
-  if (!process.env.CREDENTIALS_JSON) {
-    // Local dev — persist to file
+  // Always write to file for in-session refreshes
+  try {
     const filePath = path.join(__dirname, "token.json");
-    const current = fs.existsSync(filePath) ? JSON.parse(fs.readFileSync(filePath)) : {};
+    const current  = fs.existsSync(filePath) ? JSON.parse(fs.readFileSync(filePath)) : {};
     fs.writeFileSync(filePath, JSON.stringify({ ...current, ...tokens }));
-    console.log("🔄 Token saved to token.json");
-  } else {
-    // Railway — token is kept in memory only
-    // If you need to persist after restart, update TOKEN_JSON variable manually
-    console.log("🔄 Token refreshed in memory (Railway mode)");
+  } catch (err) {
+    console.error("❌ Could not write token.json:", err.message);
   }
+  // Always log so you can update TOKEN_JSON on Railway after a refresh
+  console.log("🔄 Token refreshed — update TOKEN_JSON on Railway with:\n" + JSON.stringify(tokens));
 }
 
 const credentials = loadCredentials();
@@ -70,8 +67,7 @@ if (savedToken) {
 }
 
 oAuth2Client.on("tokens", (tokens) => {
-  const current = oAuth2Client.credentials || {};
-  const merged  = { ...current, ...tokens };
+  const merged = { ...oAuth2Client.credentials, ...tokens };
   oAuth2Client.setCredentials(merged);
   saveToken(merged);
 });
@@ -135,22 +131,38 @@ app.get("/testAuth", (req, res) => {
 });
 
 // ================= APPS SCRIPT HELPER =================
+// FIX: Apps Script can return an HTML page (login wall, error page, stale deployment).
+// Always read body as text first, then attempt JSON.parse safely.
+// The web app MUST be deployed as "Anyone, even anonymous" — no auth header is sent.
 async function linkFormToSpreadsheet(formId) {
   try {
     console.log(`🔗 Linking formId=${formId} to central spreadsheet...`);
-    const res = await fetch(APPS_SCRIPT_URL, {
+
+    const res  = await fetch(APPS_SCRIPT_URL, {
       method : "POST",
       headers: { "Content-Type": "application/json" },
       body   : JSON.stringify({ action: "linkForm", formId })
     });
-    const data = await res.json();
+
+    const text = await res.text();
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      console.error(`🔗 ❌ Apps Script returned non-JSON (HTTP ${res.status})`);
+      console.error(`🔗    First 300 chars: ${text.slice(0, 300)}`);
+      console.error(`🔗    → Make sure the Apps Script is deployed as "Anyone, even anonymous"`);
+      return;
+    }
+
     if (data.status === "success") {
       console.log(`🔗 ✅ Form linked: ${data.title}`);
     } else {
       console.error(`🔗 ❌ linkForm failed:`, data.message);
     }
   } catch (err) {
-    console.error(`🔗 ❌ linkForm error:`, err.message);
+    console.error(`🔗 ❌ linkForm network error:`, err.message);
   }
 }
 
@@ -264,6 +276,17 @@ function dateItem(title, idx) {
   };
 }
 
+// ================= ENTRY ID MAP =================
+const TITLE_TO_KEY = {
+  "Formation ID"         : "formationId",
+  "Intitulé de l'action" : "intituleAction",
+  "Collaborateur"        : "nomPrenom",
+  "Matricule"            : "matricule",
+  "Service"              : "service",
+  "Formateur"            : "formateur",
+  "Date(s)"              : "dates",
+};
+
 // ================= MAIN POST =================
 app.post("/createForm", async (req, res) => {
   try {
@@ -281,23 +304,19 @@ app.post("/createForm", async (req, res) => {
     const formsApi = google.forms({ version: "v1", auth: oAuth2Client });
     const t0 = Date.now();
 
-    // ── CALL 1: Create form ──────────────────────────────────────
-    console.log("CALL 1: Creating form...");
+    // ── Step 1: Create form ──────────────────────────────────────
+    console.log("🚀 [1/3] Creating form...");
     const createRes = await formsApi.forms.create({
-      requestBody: {
-        info: { title: `Évaluation Formation - ${themeNom}` }
-      }
+      requestBody: { info: { title: `Évaluation Formation - ${themeNom}` } }
     });
-
     const formId  = createRes.data.formId;
     const formUrl = `https://docs.google.com/forms/d/${formId}/viewform`;
-    console.log(`CALL 1 ✅ formId: ${formId} (${Date.now() - t0}ms)`);
+    console.log(`✅ Form created: ${formId} (${Date.now() - t0}ms)`);
 
-    // ── Build questions ──────────────────────────────────────────
+    // ── Step 2: Build and send all questions ─────────────────────
     let idx = 0;
     const requests = [];
 
-    // Set description
     requests.push({
       updateFormInfo: {
         info: {
@@ -307,16 +326,14 @@ app.post("/createForm", async (req, res) => {
       }
     });
 
-    // Prefilled fields
     requests.push(lockedTextItem("Formation ID",          "🔒 Ne pas modifier",            idx++));
     requests.push(lockedTextItem("Intitulé de l'action",  "🔒 Pré-rempli automatiquement", idx++));
-    requests.push(lockedTextItem("Collaborateur",          "🔒 Pré-rempli automatiquement",idx++));
-    requests.push(lockedTextItem("Matricule",              "🔒 Pré-rempli automatiquement",idx++));
-    requests.push(lockedTextItem("Service",                "🔒 Pré-rempli automatiquement",idx++));
-    requests.push(lockedTextItem("Formateur",              "🔒 Pré-rempli automatiquement",idx++));
-    requests.push(lockedTextItem("Date(s)",                "🔒 Pré-rempli automatiquement",idx++));
+    requests.push(lockedTextItem("Collaborateur",         "🔒 Pré-rempli automatiquement", idx++));
+    requests.push(lockedTextItem("Matricule",             "🔒 Pré-rempli automatiquement", idx++));
+    requests.push(lockedTextItem("Service",               "🔒 Pré-rempli automatiquement", idx++));
+    requests.push(lockedTextItem("Formateur",             "🔒 Pré-rempli automatiquement", idx++));
+    requests.push(lockedTextItem("Date(s)",               "🔒 Pré-rempli automatiquement", idx++));
 
-    // Evaluation questions
     requests.push(checkboxItem("Par quel moyen vous avez apprécié votre collaborateur ?", [
       "Entretien",
       "Mise en situation professionnelle/Observation",
@@ -343,47 +360,46 @@ app.post("/createForm", async (req, res) => {
     requests.push(paragraphItem("Avez-vous des propositions et des suggestions d'amélioration ?", "Vos suggestions...", idx++));
     requests.push(dateItem("Date de l'évaluation", idx++));
 
-    // ── CALL 2: batchUpdate ──────────────────────────────────────
-    console.log("CALL 2: Adding questions...");
-    const t1 = Date.now();
-
+    console.log("📝 [2/3] Adding questions...");
+    const t1       = Date.now();
     const batchRes = await formsApi.forms.batchUpdate({
       formId,
       requestBody: { requests }
     });
+    console.log(`✅ Questions added (${Date.now() - t1}ms)`);
 
-    console.log(`CALL 2 ✅ Questions added (${Date.now() - t1}ms)`);
-
-    // ── Extract entry IDs from batchUpdate response ──────────────
-    const titleToKey = {
-      "Formation ID"        : "formationId",
-      "Intitulé de l'action": "intituleAction",
-      "Collaborateur"       : "nomPrenom",
-      "Matricule"           : "matricule",
-      "Service"             : "service",
-      "Formateur"           : "formateur",
-      "Date(s)"             : "dates",
-    };
-
+    // ── Step 3: Extract entry IDs by position ────────────────────
+    // batchUpdate replies mirror requests 1-to-1.
+    // Reply shape: { createItem: { itemId, questionId: ["hexId"] } }
+    // Title is NOT echoed back — match by request index.
+    console.log("🔍 [3/3] Reading back questionIds...");
     const entryIds = {};
     const replies  = batchRes.data.replies || [];
 
-    replies.forEach(reply => {
-      const item = reply.createItem?.item;
-      if (!item) return;
-      const key = titleToKey[item.title];
-      if (!key) return;
-      const questionId = item.questionItem?.question?.questionId;
-      if (questionId) entryIds[key] = parseInt(questionId, 16);
+    const requestKeyByIndex = {};
+    requests.forEach((req, i) => {
+      if (req.createItem) {
+        const key = TITLE_TO_KEY[req.createItem.item?.title];
+        if (key) requestKeyByIndex[i] = key;
+      }
     });
 
-    // Fallback: fetch form if any entry IDs are missing
-    const missingKeys = Object.keys(titleToKey).filter(t => !entryIds[titleToKey[t]]);
+    replies.forEach((reply, i) => {
+      const key         = requestKeyByIndex[i];
+      if (!key) return;
+      const questionIds = reply.createItem?.questionId;
+      if (Array.isArray(questionIds) && questionIds.length > 0) {
+        entryIds[key] = parseInt(questionIds[0], 16);
+      }
+    });
+
+    // Fallback GET for any IDs still missing
+    const missingKeys = Object.keys(TITLE_TO_KEY).filter(t => !entryIds[TITLE_TO_KEY[t]]);
     if (missingKeys.length > 0) {
-      console.log("Fallback: fetching form for missing entry IDs...");
+      console.warn("⚠️  Falling back to GET for missing IDs:", missingKeys);
       const formDetails = await formsApi.forms.get({ formId });
       (formDetails.data.items || []).forEach(item => {
-        const key = titleToKey[item.title];
+        const key = TITLE_TO_KEY[item.title];
         if (key && !entryIds[key] && item.questionItem?.question?.questionId) {
           entryIds[key] = parseInt(item.questionItem.question.questionId, 16);
         }
@@ -392,7 +408,7 @@ app.post("/createForm", async (req, res) => {
 
     console.log(`✅ Done in ${Date.now() - t0}ms — entryIds:`, entryIds);
 
-    // Link form to spreadsheet in background
+    // Fire-and-forget — does not block the response
     linkFormToSpreadsheet(formId);
 
     return res.json({
@@ -419,14 +435,10 @@ app.post("/createForm", async (req, res) => {
 // ================= START SERVER =================
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
   if (!isAuthorized()) {
     console.log("\n🔐 Not authorized yet — open this URL in your browser:");
     console.log(getAuthUrl());
     console.log();
   }
 });
-
-// ================= EXPORT FOR CLOUD FUNCTIONS =================
-const functions = require("@google-cloud/functions-framework");
-functions.http("myHttpFunction", app);
